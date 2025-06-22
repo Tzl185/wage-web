@@ -12,17 +12,12 @@ from openpyxl.workbook import Workbook
 st.set_page_config(page_title="工资表处理工具", layout="centered")
 
 # -----------------------
-# 将 .xls 转换为 .xlsx
-# -----------------------
 def convert_xls_to_xlsx(xls_path):
     df = pd.read_excel(xls_path, header=None, engine='xlrd')
-    new_path = xls_path + "x"  # 原文件路径 + x
+    new_path = xls_path + "x"
     df.to_excel(new_path, header=False, index=False, engine='openpyxl')
     return new_path
 
-# -----------------------
-# 获取合并单元格标题（第3-4行）
-# -----------------------
 def get_merged_headers(path, header_row=4):
     wb = load_workbook(path, data_only=True)
     ws = wb.active
@@ -31,7 +26,6 @@ def get_merged_headers(path, header_row=4):
         for row in range(rng.min_row, rng.max_row + 1):
             for col in range(rng.min_col, rng.max_col + 1):
                 merged[(row, col)] = ws.cell(rng.min_row, rng.min_col).value
-
     headers = []
     for col in range(1, ws.max_column + 1):
         top = merged.get((header_row - 1, col)) or ws.cell(header_row - 1, col).value
@@ -41,10 +35,7 @@ def get_merged_headers(path, header_row=4):
     return headers
 
 # -----------------------
-# 处理工资数据
-# -----------------------
-def process_file_a(folder_path, output_file="文件A_汇总结果.xlsx"):
-    log = io.StringIO()
+def process_file_a(folder_path, output_file="文件A_汇总结果.xlsx", log_area=None):
     all_data = []
     all_values = {}
 
@@ -53,17 +44,18 @@ def process_file_a(folder_path, output_file="文件A_汇总结果.xlsx"):
             if fname.endswith(('.xls', '.xlsx')) and not fname.startswith('~$'):
                 fpath = os.path.join(root, fname)
                 try:
-                    print(f"📄 正在处理: {fname}", file=log)
+                    if log_area: log_area.write(f"\n📄 正在处理: {fname}\n")
 
                     if fpath.endswith(".xls"):
                         fpath = convert_xls_to_xlsx(fpath)
+                        if log_area: log_area.write("📎 已转换为 .xlsx\n")
 
                     headers = get_merged_headers(fpath)
                     df = pd.read_excel(fpath, header=3, engine='openpyxl')
                     df.columns = headers
 
-                    budget_col = headers[1]  # 默认第2列为“预算单位”
-                    wage_cols = headers[16:30]  # 默认第17-30列
+                    budget_col = headers[1]
+                    wage_cols = headers[16:30]
 
                     df_filtered = df[[budget_col] + wage_cols]
                     df_filtered[wage_cols] = df_filtered[wage_cols].apply(pd.to_numeric, errors='coerce').fillna(0)
@@ -82,24 +74,24 @@ def process_file_a(folder_path, output_file="文件A_汇总结果.xlsx"):
                     if not df_grouped.empty:
                         all_data.append(df_grouped)
 
+                    if log_area: log_area.write("✅ 处理完成\n")
+
                 except Exception as e:
-                    print(f"❌ 处理失败: {fname}，原因：{e}", file=log)
+                    if log_area: log_area.write(f"❌ 错误: {e}\n")
 
     if all_data:
         df_all = pd.concat(all_data)
         df_final = df_all.groupby(df_all.index).sum()
         out_path = os.path.join(folder_path, output_file)
         df_final.to_excel(out_path)
-        print(f"\n✅ 汇总完成，保存至：{out_path}", file=log)
-        return out_path, log.getvalue()
+        if log_area: log_area.write(f"\n✅ 汇总完成，保存至：{output_file}\n")
+        return out_path
     else:
-        print("❌ 没有找到有效数据，请检查 Excel 格式或列名", file=log)
-        return None, log.getvalue()
+        if log_area: log_area.write("❌ 没有找到有效数据，请检查 Excel 格式或列名\n")
+        return None
 
 # -----------------------
-# Streamlit 前端界面
-# -----------------------
-st.title("📊 工资表自动处理工具（支持 .xls + 合并表头）")
+st.title("📊 工资表自动处理工具（实时日志）")
 uploaded_zip = st.file_uploader("请上传包含工资表的压缩包（.zip）", type=["zip"])
 
 if uploaded_zip:
@@ -118,14 +110,17 @@ if uploaded_zip:
 
         st.markdown("---")
         st.markdown("### 🔧 正在分析并生成文件A...")
+        log_placeholder = st.empty()
 
-        out_path, log_text = process_file_a(tmpdir)
+        with st.spinner("⏳ 正在处理中..."):
+            log_text = st.empty()
+            file_a_path = process_file_a(tmpdir, log_area=log_text)
 
-        st.markdown("### 📜 日志输出：")
+        st.markdown("### 📜 处理日志：")
         st.text(log_text)
 
-        if out_path:
-            with open(out_path, "rb") as f:
+        if file_a_path:
+            with open(file_a_path, "rb") as f:
                 st.download_button(
                     label="📥 下载汇总结果文件A",
                     data=f,
