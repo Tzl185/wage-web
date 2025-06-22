@@ -1,114 +1,132 @@
 import streamlit as st
-import pandas as pd
-import zipfile
 import os
-import shutil
+import pandas as pd
 from openpyxl import load_workbook
+import zipfile
+import tempfile
+import io
 
+st.set_page_config(page_title="工资表处理工具", layout="centered")
+
+# ----------------------
+# 处理合并单元格表头
+# ----------------------
+def get_flat_column_names(filepath, header_row=4):
+    wb = load_workbook(filepath, data_only=True)
+    ws = wb.active
+    merged_dict = {}
+    for merged_range in ws.merged_cells.ranges:
+        min_col, min_row, max_col, max_row = (
+            merged_range.min_col, merged_range.min_row,
+            merged_range.max_col, merged_range.max_row
+        )
+        value = ws.cell(row=min_row, column=min_col).value
+        for row in range(min_row, max_row + 1):
+            for col in range(min_col, max_col + 1):
+                merged_dict[(row, col)] = value
+
+    col_names = []
+    for col in range(1, ws.max_column + 1):
+        upper = merged_dict.get((header_row - 1, col)) or ws.cell(row=header_row - 1, column=col).value
+        lower = merged_dict.get((header_row, col)) or ws.cell(row=header_row, column=col).value
+        parts = []
+        if upper: parts.append(str(upper).strip())
+        if lower and lower != upper: parts.append(str(lower).strip())
+        col_name = "-".join(parts) if parts else f"列{col}"
+        col_names.append(col_name)
+    return col_names
+
+# ----------------------
+# 处理 Excel 文件夹
+# ----------------------
 def process_file_a(folder_path, output_file="文件A_汇总结果.xlsx"):
+    log = io.StringIO()
     all_data = []
-    positive_values = {}
+    all_values = {}
 
-    for filename in os.listdir(folder_path):
-        if filename.endswith(('.xls', '.xlsx')) and not filename.startswith('~$'):
-            filepath = os.path.join(folder_path, filename)
-            try:
-                df = pd.read_excel(filepath, header=3)
-                budget_unit_col = df.columns[1]
-                wage_cols = df.columns[16:30]
-                df_filtered = df[[budget_unit_col] + list(wage_cols)]
-                df_filtered[wage_cols] = df_filtered[wage_cols].apply(pd.to_numeric, errors='coerce').fillna(0)
-                df_grouped = df_filtered.groupby(budget_unit_col).sum()
-                all_data.append(df_grouped)
-            except Exception as e:
-                print(f"{filename} 错误: {e}")
+    for root, dirs, files in os.walk(folder_path):
+        for filename in files:
+            if filename.endswith(('.xlsx')) and not filename.startswith('~$'):
+                filepath = os.path.join(root, filename)
+                try:
+                    print(f"\n📄 正在处理: {filename}", file=log)
+                    columns = get_flat_column_names(filepath, header_row=4)
+                    df = pd.read_excel(filepath, header=3, engine="openpyxl")
+                    df.columns = columns
+                    budget_unit_col = columns[1]
+                    wage_cols = columns[16:30]
+                    df_filtered = df[[budget_unit_col] + wage_cols]
+                    df_filtered[wage_cols] = df_filtered[wage_cols].apply(pd.to_numeric, errors='coerce').fillna(0)
+                    df_grouped = df_filtered.groupby(budget_unit_col).sum()
+
+                    for budget_unit, row in df_grouped.iterrows():
+                        for wage_type in wage_cols:
+                            value = row[wage_type]
+                            wage_type_str = str(wage_type).strip()
+                            if "绩效工资" in wage_type_str:
+                                wage_type_str = wage_type_str.replace("绩效工资", "基础性绩效")
+                            if "行政医疗" in wage_type_str:
+                                wage_type_str = wage_type_str.replace("行政医疗", "职工基本医疗（行政）")
+                            elif "事业医疗" in wage_type_str:
+                                wage_type_str = wage_type_str.replace("事业医疗", "基本医疗（事业）")
+                            elif "医疗保险" in wage_type_str:
+                                wage_type_str = wage_type_str.replace("医疗保险", "基本医疗")
+                            key = (str(budget_unit).strip(), wage_type_str)
+                            all_values[key] = value
+
+                    if not df_grouped.empty:
+                        all_data.append(df_grouped)
+
+                except Exception as e:
+                    print(f"❌ 文件 {filename} 处理失败: {e}", file=log)
 
     if all_data:
         df_all = pd.concat(all_data)
         df_final = df_all.groupby(df_all.index).sum()
         output_path = os.path.join(folder_path, output_file)
         df_final.to_excel(output_path)
-
-        for budget_unit, row in df_final.iterrows():
-            for wage_type in wage_cols:
-                value = row[wage_type]
-                if value > 0:
-                    if "绩效工资" in wage_type:
-                        wage_type = wage_type.replace("绩效工资", "基础性绩效")
-                    key = (str(budget_unit).strip(), str(wage_type).strip())
-                    positive_values[key] = value
-        return output_path, positive_values
+        print(f"\n✅ 汇总完成，已保存到: {output_path}", file=log)
+        return output_path, log.getvalue()
     else:
-        return None, None
+        print("❌ 没有找到有效数据，请检查Excel格式或列名", file=log)
+        return None, log.getvalue()
 
-def update_file_b(file_a_path, file_b_path, output_dir):
-    df_a = pd.read_excel(file_a_path, index_col=0)
-    wage_cols = df_a.columns
+# ----------------------
+# Streamlit 界面
+# ----------------------
+st.title("📊 工资表自动处理工具（带合并单元格支持）")
 
-    positive_values = {}
-    for budget_unit, row in df_a.iterrows():
-        for wage_type in wage_cols:
-            value = row[wage_type]
-            if value > 0:
-                if "绩效工资" in wage_type:
-                    wage_type = wage_type.replace("绩效工资", "基础性绩效")
-                key = (str(budget_unit).strip(), str(wage_type).strip())
-                positive_values[key] = value
+uploaded_zip = st.file_uploader("请上传包含多个工资表的 ZIP 文件", type=["zip"])
 
-    wb = load_workbook(file_b_path)
-    sheet = wb.active
-    j_col_index = 10
-    for row_idx in range(2, sheet.max_row + 1):
-        unit_info = str(sheet.cell(row=row_idx, column=1).value or "")
-        budget_project = str(sheet.cell(row=row_idx, column=2).value or "")
-        unit_info_cleaned = unit_info.replace("-", "").replace(" ", "")
-        for (budget_unit, wage_type), value in positive_values.items():
-            budget_unit_cleaned = budget_unit.replace(" ", "")
-            if ((budget_unit_cleaned in unit_info_cleaned or unit_info_cleaned in budget_unit_cleaned)
-                    and wage_type in budget_project):
-                sheet.cell(row=row_idx, column=j_col_index).value = value
-                break
+if uploaded_zip:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        zip_path = os.path.join(tmpdir, "upload.zip")
+        with open(zip_path, "wb") as f:
+            f.write(uploaded_zip.read())
 
-    output_path = os.path.join(output_dir, "updated_" + os.path.basename(file_b_path))
-    wb.save(output_path)
-    return output_path
+        with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+            zip_ref.extractall(tmpdir)
 
-# -------- Streamlit 界面部分 --------
-st.title("Excel 工资处理自动化网站")
-st.write("上传压缩包和模板文件，自动生成汇总文件和更新后的模板。")
+        # 展示解压内容
+        st.markdown("### 📂 解压后的文件列表：")
+        for root, _, files in os.walk(tmpdir):
+            for name in files:
+                st.markdown(f"- `{os.path.join(root, name).replace(tmpdir, '')}`")
 
-zip_file = st.file_uploader("上传 Excel 压缩包（多个工资表）", type="zip")
-template_file = st.file_uploader("上传模板文件（项目细化导入模板）", type=["xls", "xlsx"])
+        # 处理 Excel 文件夹
+        st.markdown("---")
+        st.markdown("### ⚙️ 正在处理文件A...")
 
-if st.button("运行程序"):
-    if zip_file and template_file:
-        with st.spinner("正在处理，请稍候..."):
-            work_dir = "temp_upload"
-            os.makedirs(work_dir, exist_ok=True)
+        output_path, log_text = process_file_a(tmpdir)
 
-            zip_path = os.path.join(work_dir, "uploaded.zip")
-            with open(zip_path, "wb") as f:
-                f.write(zip_file.read())
+        st.markdown("### 📋 处理日志：")
+        st.text(log_text)
 
-            with zipfile.ZipFile(zip_path, 'r') as zip_ref:
-                zip_ref.extractall(work_dir)
-
-            template_path = os.path.join(work_dir, "template.xlsx")
-            with open(template_path, "wb") as f:
-                f.write(template_file.read())
-
-            a_path, _ = process_file_a(work_dir)
-            if a_path:
-                b_path = update_file_b(a_path, template_path, work_dir)
-
-                with open(a_path, "rb") as f:
-                    st.download_button("下载汇总文件A", f, file_name="文件A_汇总结果.xlsx")
-
-                with open(b_path, "rb") as f:
-                    st.download_button("下载更新后的文件B", f, file_name="updated_项目细化导入模板.xlsx")
-            else:
-                st.error("处理失败，请检查上传的文件格式")
-
-            shutil.rmtree(work_dir)
-    else:
-        st.warning("请上传所有文件")
+        if output_path:
+            with open(output_path, "rb") as f:
+                st.download_button(
+                    label="📥 下载汇总结果（文件A）",
+                    data=f,
+                    file_name="文件A_汇总结果.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                )
